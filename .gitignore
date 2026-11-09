@@ -60,3 +60,6 @@ Desktop.ini
 # 第三方二进制（可重新下载）
 fabric-installer-*.jar
 fabric-server-*.jar
+
+# SSH 私钥——绝不进仓库
+.ssh/
