@@ -1,0 +1,23 @@
+{
+	"schemaVersion": 1,
+	"id": "containerbot",
+	"version": "${version}",
+	"name": "Container Bot",
+	"description": "基于 Carpet 假人的容器搜寻与自动提取模组：假人自行寻路、开箱并按指定物品/数量取货。",
+	"authors": [
+		"containerbot"
+	],
+	"license": "MIT",
+	"environment": "*",
+	"entrypoints": {
+		"main": [
+			"com.containerbot.ContainerBotMod"
+		]
+	},
+	"depends": {
+		"fabricloader": ">=0.16.0",
+		"minecraft": "~1.21.8",
+		"java": ">=21",
+		"fabric-api": "*"
+	}
+}

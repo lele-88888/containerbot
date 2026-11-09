@@ -1,0 +1,120 @@
+plugins {
+	// 1.21.8 起 Fabric 官方示例使用的插件 ID（旧的 fabric-loom 已更名）
+	id 'net.fabricmc.fabric-loom-remap' version "${loom_version}"
+}
+
+// ---------------------------------------------------------------------------
+// 国内网络适配：把 Loom 硬编码的 Minecraft 依赖库地址换到 BMCLAPI 镜像。
+//
+// 依据：反编译 fabric-loom-1.18.2.jar 得到 net/fabricmc/loom/util/MirrorUtil，
+// 它通过「项目扩展属性」读取以下键（均有境外默认值）：
+//   loom_libraries_base      默认 https://libraries.minecraft.net/
+//   loom_resources_base      默认 https://resources.download.minecraft.net/
+//   loom_version_manifests   默认 https://piston-meta.mojang.com/mc/game/version_manifest_v2.json
+//   loom_fabric_repository   默认 https://maven.fabricmc.net/
+//
+// 注意：这些键必须用 ext. 设置。MirrorUtil 走的是 ExtraPropertiesExtension.has()，
+// 它只认扩展属性，不认 gradle.properties 里的同名项目属性。
+// ---------------------------------------------------------------------------
+ext.loom_libraries_base = 'https://bmclapi2.bangbang93.com/maven/'
+
+version = project.version
+group = project.group
+
+base {
+	archivesName = project.archives_base_name
+}
+
+repositories {
+	// Loom 已自动注入 Minecraft / Fabric 所需仓库，这里无需额外配置
+}
+
+dependencies {
+	minecraft "com.mojang:minecraft:${project.minecraft_version}"
+	// 使用官方 Mojang 映射：与 Carpet 自身源码保持一致，避免 Yarn 额外翻译一层
+	mappings loom.officialMojangMappings()
+
+	modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
+	modImplementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_api_version}"
+}
+
+processResources {
+	inputs.property "version", project.version
+
+	// 必须显式指定 UTF-8：Gradle 处理资源时默认用系统编码（中文 Windows 上是 GBK），
+	// 而 fabric.mod.json 里的中文描述是 UTF-8，不指定就会被读成乱码。
+	filteringCharset = 'UTF-8'
+
+	filesMatching("fabric.mod.json") {
+		expand "version": project.version
+	}
+}
+
+tasks.withType(JavaCompile).configureEach {
+	it.options.release = 21
+	it.options.encoding = 'UTF-8'
+}
+
+java {
+	sourceCompatibility = JavaVersion.VERSION_21
+	targetCompatibility = JavaVersion.VERSION_21
+}
+
+// ---------------------------------------------------------------------------
+// 版本归档：每次 build 结束后，把最终 jar 复制一份留档
+//
+// 规则（按用户要求：测试不覆盖正式版本）：
+//   · 正式版本（version 不含 '-'）→ releases/       **已存在且内容不同则拒绝覆盖**
+//   · 测试版本（version 含 '-'）  → releases/test/  随便覆盖，不污染正式库
+//
+// 例：version=1.25.0        → releases/containerbot-1.25.0.jar
+//     version=1.26.0-TEST   → releases/test/containerbot-1.26.0-TEST.jar
+// ---------------------------------------------------------------------------
+tasks.register('archiveRelease') {
+	group = 'containerbot'
+	description = '归档构建产物；正式版本不覆盖，测试版本进 releases/test/'
+
+	doLast {
+		def ver = project.version.toString()
+		def isTest = ver.contains('-')
+		def base = project.archives_base_name
+
+		def src = layout.buildDirectory.file("libs/${base}-${ver}.jar").get().asFile
+		if (!src.exists()) {
+			println ""
+			println "=== 归档跳过：找不到产物 ${src.name} ==="
+			return
+		}
+
+		def dir = isTest ? file("${projectDir}/releases/test")
+				: file("${projectDir}/releases")
+		dir.mkdirs()
+
+		def dst = new File(dir, "${base}-${ver}.jar")
+
+		if (!isTest && dst.exists()) {
+			if (dst.bytes == src.bytes) {
+				println ""
+				println "=== 版本 ${ver} 已归档且内容相同，未重复写入 ==="
+				println "    ${dst}"
+				return
+			}
+			throw new GradleException(
+					"版本 ${ver} 已存在且内容不同，拒绝覆盖。\n"
+					+ "  已有: ${dst}\n"
+					+ "  如需发布新版本请提升 gradle.properties 里的 version；\n"
+					+ "  如只是测试构建，请用带后缀的版本号（例如 ${ver}-TEST），它会归档到 releases/test/。")
+		}
+
+		dst.bytes = src.bytes
+		println ""
+		println "=== 已归档版本 ${ver}${isTest ? '（测试构建）' : ''} ==="
+		println "    ${dst}"
+		println "    ${dst.length()} 字节"
+		println ""
+	}
+}
+
+tasks.named('build') {
+	finalizedBy 'archiveRelease'
+}
