@@ -1269,7 +1269,15 @@ public final class BotCommand {
 		for (BlockPos p : found) {
 			if (!(level.getBlockEntity(p) instanceof net.minecraft.world.Container c)) continue;
 			containers++;
-			byType.merge(c.getClass().getSimpleName().replace("BlockEntity", ""), 1, Integer::sum);
+			// 不能用 getClass().getSimpleName()：Fabric 运行时用的是 intermediary 类名，
+			// 客户端和服务端都会显示成 class_2595 这种。改用方块自己的本地化名。
+			String typeName;
+			try {
+				typeName = level.getBlockState(p).getBlock().getName().getString();
+			} catch (Throwable t) {
+				typeName = "容器";
+			}
+			byType.merge(typeName, 1, Integer::sum);
 
 			int size = c.getContainerSize();
 			int used = 0;
@@ -1310,7 +1318,10 @@ public final class BotCommand {
 			}
 			sb.append("\n合计 ").append(total).append(" 件");
 		}
-		if (fullest != null) {
+		// 只有确实存在非空容器时才报「最满的」。
+		// 全空时 fullestUsed 是 0，若照常输出会得到「已用 0/27 格」——
+		// 既没意义，又和上面的「内容物: （全空）」重复，还容易让人误以为里面还有东西。
+		if (fullest != null && fullestUsed > 0) {
 			sb.append("\n最满的容器: ").append(fmt(fullest))
 					.append(" 已用 ").append(fullestUsed).append("/").append(fullestSize).append(" 格");
 		}

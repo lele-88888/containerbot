@@ -105,6 +105,14 @@ public class LootBot {
 	private int collectedTotal;
 	/** 当前任务累计取得的数量（含盒内实际数量） */
 	private int collectedForTask;
+
+	/**
+	 * 任务开始时背包里已有的目标物品数量，**不计入本任务进度**。
+	 *
+	 * <p>初值 -1 表示尚未取样——首次调用 {@code countForTask} 时取基线，
+	 * 那时还没开始取货，所以取到的就是"原本就有多少"。</p>
+	 */
+	private int baselineForTask = -1;
 	/**
 	 * 已经卸货出去的件数。
 	 *
@@ -546,6 +554,10 @@ public class LootBot {
 		this.repeatIntervalTicks = Math.max(20, intervalTicks);
 		this.repeatEnabled = true;
 		this.repeatWaitTicks = 0;
+		// 空闲时开启：下一 tick 会立刻开一轮（见 tick 里的「立即开始新一轮」分支）
+		this.status = task != null
+				? "循环已开启（本轮结束后生效）"
+				: "循环已开启，马上开始第一轮";
 		return true;
 	}
 
@@ -770,6 +782,7 @@ public class LootBot {
 		this.pathFailures = 0;
 		this.containersSearched = 0;
 		this.collectedForTask = 0;
+		this.baselineForTask = -1;
 		this.deliveredCount = 0;
 		this.returnDim = null;
 		this.returnPos = null;
@@ -930,6 +943,20 @@ public class LootBot {
 		// 注意必须放在 `if (task == null) return;` **之前**——一轮结束后 task 是 null，
 		// 若放在后面就永远轮不到这里，循环再也不会重启（实测症状：状态停在
 		// 「本轮结束，等 N 秒后重跑」不再变化）。
+		// 循环已开启、但当前空闲且没有待倒计时 → 立刻开一轮。
+		//
+		// 这个分支是为了修「空闲时开循环毫无反应」：
+		// enableRepeat() 把 repeatWaitTicks 置为 0，而下面的倒计时分支
+		// 条件是 `repeatWaitTicks > 0`，0 永远进不去，于是一轮也启动不了。
+		// 实测症状：任务跑完后敲 /cbot repeat Bot 60，日志里一句都没有。
+		if (task == null && repeatEnabled && repeatTask != null
+				&& repeatWaitTicks <= 0 && queue.isEmpty()
+				&& state != State.WAITING_SPAWN) {
+			Diag.trace(server, name, "循环：空闲且无待倒计时，立即开始新一轮");
+			beginTask(server, repeatTask);
+			return;
+		}
+
 		if (repeatWaitTicks > 0) {
 			repeatWaitTicks--;
 			if (repeatWaitTicks <= 0 && repeatEnabled && repeatTask != null) {
@@ -1251,6 +1278,13 @@ public class LootBot {
 			state = openingForUnload ? State.UNLOAD : State.LOOT;
 			stateTicks = 0;
 			status = openingForUnload ? "卸货箱已打开" : "容器已打开";
+
+			// 「已搜容器」在真正打开时就计一次，而不是等"翻完发现没货"才计。
+			// 否则只要取到货就直接完成任务、提前 return，这个数会一直显示 0，
+			// 与实际行为（明明开过箱子）自相矛盾。卸货箱不算搜索。
+			if (!openingForUnload) {
+				containersSearched++;
+			}
 			return;
 		}
 
@@ -1364,12 +1398,20 @@ public class LootBot {
 
 			if (!stack.is(task.item())) continue;
 
-			// 精确模式：整组搬会超额的话就跳过这一组（宁少不多）
+			// 精确模式：整组搬会超额 → 用鼠标分流精确取走 need 个
 			if (exactEnabled) {
 				int need = task.count() - countForTask(bot);
 				if (need <= 0) break;
 				if (stack.getCount() > need) {
-					continue;
+					int have = stack.getCount();
+					var statItem = stack.getItem();
+					if (splitTake(menu, i, have, need, bot)) {
+						itemStats.merge(statItem, need, Integer::sum);
+						movedAny = true;
+						Diag.trace(server, name, "精确拆分：从 " + have + " 个中取走 " + need + " 个");
+						break;   // 已经够了
+					}
+					continue;    // 这个槽拆不了，试下一个
 				}
 			}
 
@@ -1398,7 +1440,7 @@ public class LootBot {
 
 		if (!movedAny) {
 			visited.add(container);
-			containersSearched++;
+			// 计数已在开箱时加过，这里不再重复
 			closeContainer(bot);
 			state = State.SCAN;
 			stateTicks = 0;
@@ -1720,9 +1762,81 @@ public class LootBot {
 	/** 统计任务进度 = 已卸货交付的 + 身上还带着的。
 	 *  顺带刷新 {@code collectedForTask}，供状态显示与完成报告使用。
 	 *  搬家模式没有目标物品，改计「所有物品总数」。 */
+	/**
+	 * 容器某个槽位里/外「精确取走」need 个（need &lt; 该槽数量）。
+	 *
+	 * <p>原版没有"取一半"这种操作，只能用<b>鼠标分流</b>一步一步做，
+	 * 全程等价真人操作：</p>
+	 * <ol>
+	 *   <li>左键点该槽 → 光标拿起整组 S 个</li>
+	 *   <li>右键点同一槽 (S - need) 次 → 每次放回 1 个</li>
+	 *   <li>左键点背包空位 → 光标上剩的 need 个进背包</li>
+	 * </ol>
+	 *
+	 * <p>第二步最多 63 次点击，都是本地菜单操作，不产生网络往返，可以接受。</p>
+	 *
+	 * @return true 表示成功取走恰好 need 个
+	 */
+	private boolean splitTake(AbstractContainerMenu menu, int menuSlot, int have, int need, ServerPlayer bot) {
+		if (need <= 0 || need >= have) return false;
+
+		// 1. 拿起整组
+		menu.clicked(menuSlot, 0, ClickType.PICKUP, bot);
+		int carried = menu.getCarried().getCount();
+		if (carried != have) {
+			// 没按预期拿起来 → 把光标上的东西放回去，放弃这个槽
+			if (carried > 0) {
+				menu.clicked(menuSlot, 0, ClickType.PICKUP, bot);
+			}
+			return false;
+		}
+
+		// 2. 右键一枚一枚放回，直到光标只剩 need 个
+		int putBack = have - need;
+		for (int k = 0; k < putBack; k++) {
+			menu.clicked(menuSlot, 1, ClickType.PICKUP, bot);
+		}
+
+		// 3. 放到背包空位
+		int free = findFreePlayerSlot(menu, bot);
+		if (free < 0) {
+			// 背包满了：整组放回原槽，放弃
+			menu.clicked(menuSlot, 0, ClickType.PICKUP, bot);
+			Diag.trace(null, name, "精确拆分失败：背包没有空位");
+			return false;
+		}
+		menu.clicked(free, 0, ClickType.PICKUP, bot);
+		return true;
+	}
+
+	/** 在打开的菜单里找一个玩家侧的背包空位（返回菜单槽位索引，找不到返回 -1） */
+	private int findFreePlayerSlot(AbstractContainerMenu menu, ServerPlayer bot) {
+		for (int i = 0; i < menu.slots.size(); i++) {
+			net.minecraft.world.inventory.Slot slot = menu.slots.get(i);
+			if (slot.container == openContainer) continue;   // 容器侧跳过
+			if (!slot.getItem().isEmpty()) continue;
+			if (!slot.mayPickup(bot)) continue;
+			return i;
+		}
+		return -1;
+	}
+
 	private int countForTask(ServerPlayer bot) {
-		collectedForTask = deliveredCount
+		int raw = deliveredCount
 				+ (task.moveAll() ? countAllItems(bot) : countItemInInventory(bot, task));
+
+		if (task.moveAll()) {
+			collectedForTask = raw;
+			return collectedForTask;
+		}
+
+		// 必须扣掉任务开始前背包里就有的数量，否则会出现
+		// 「已达成目标数量 + 已搜容器=0」这种自相矛盾的状态：
+		// 假人本来就揣着 64 个钻石，一个箱子没搜就判完成。
+		if (baselineForTask < 0) {
+			baselineForTask = raw;
+		}
+		collectedForTask = Math.max(0, raw - baselineForTask);
 		return collectedForTask;
 	}
 
