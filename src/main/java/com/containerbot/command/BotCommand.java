@@ -313,6 +313,13 @@ public final class BotCommand {
 				.then(Commands.literal("test")
 						.executes(BotCommand::selfTest))
 
+				// ---- 任务持久化（重启后恢复）----
+				.then(Commands.literal("persist")
+						.executes(BotCommand::persistInfo)
+						.then(Commands.literal("on").executes(ctx -> setPersist(ctx, true)))
+						.then(Commands.literal("off").executes(ctx -> setPersist(ctx, false)))
+						.then(Commands.literal("save").executes(BotCommand::persistSave)))
+
 				// ---- 可用性标记（安全策略）----
 				// 默认所有假人都被标记为「有任务」，必须显式 /cbot free 才能接任务。
 				// 假人下线后会自动重新标记为「有任务」。
@@ -893,6 +900,41 @@ public final class BotCommand {
 		src.sendSuccess(() -> Component.literal(name + " 精确数量模式: "
 				+ (bot.isExactEnabled() ? "开启" : "关闭（默认）")
 				+ "；用 /cbot exact " + name + " on|off 切换"), false);
+		return 1;
+	}
+
+	// ------------------------------------------------------------------ 任务持久化
+
+	private static int setPersist(CommandContext<CommandSourceStack> ctx, boolean on) {
+		CommandSourceStack src = ctx.getSource();
+		com.containerbot.Persistence.setEnabled(on);
+		if (on) {
+			// 打开时立刻存一次，避免"开了但还没关服"的空窗期
+			com.containerbot.Persistence.saveAll(src.getServer());
+		}
+		src.sendSuccess(() -> Component.literal(on
+				? "已开启任务持久化：关服时保存，开服时自动恢复循环任务和各项设置"
+				: "已关闭任务持久化（已有的存档状态文件不会被删除）"), true);
+		return 1;
+	}
+
+	private static int persistInfo(CommandContext<CommandSourceStack> ctx) {
+		CommandSourceStack src = ctx.getSource();
+		boolean on = com.containerbot.Persistence.isEnabled();
+		src.sendSuccess(() -> Component.literal("任务持久化: " + (on ? "开启" : "关闭（默认）")
+				+ "；用 /cbot persist on|off 切换，/cbot persist save 立即保存"), false);
+		return 1;
+	}
+
+	private static int persistSave(CommandContext<CommandSourceStack> ctx) {
+		CommandSourceStack src = ctx.getSource();
+		if (!com.containerbot.Persistence.isEnabled()) {
+			src.sendFailure(Component.literal("任务持久化没开启，先 /cbot persist on"));
+			return 0;
+		}
+		com.containerbot.Persistence.saveAll(src.getServer());
+		src.sendSuccess(() -> Component.literal(
+				"已立即保存（存档目录 containerbot/state.json）"), true);
 		return 1;
 	}
 

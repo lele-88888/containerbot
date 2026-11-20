@@ -24,7 +24,16 @@ public class ContainerBotMod implements ModInitializer {
 		CommandRegistrationCallback.EVENT.register((dispatcher, registryAccess, environment) ->
 				BotCommand.register(dispatcher));
 
-		ServerTickEvents.END_SERVER_TICK.register(BotManager::tick);
+		ServerTickEvents.END_SERVER_TICK.register(server -> {
+			BotManager.tick(server);
+			Persistence.tick(server);   // 处理排队中的假人生成
+		});
+
+		// 任务持久化：开关由 /cbot persist on|off 控制（默认关闭）
+		net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents.SERVER_STARTED.register(
+				Persistence::loadAll);
+		net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents.SERVER_STOPPING.register(
+				Persistence::saveAll);
 
 		LOGGER.info("[ContainerBot] 已加载，指令: /cbot");
 	}

@@ -478,6 +478,40 @@ public class LootBot {
 		return filterBlack;
 	}
 
+	/** 最近一次跑过的任务（持久化与"跑完一次再开循环"都用它） */
+	public LootTask getLastTask() {
+		return lastTask;
+	}
+
+	/** 直接设置白/黑名单（从存档恢复时用，不经过命令层） */
+	public void setFilters(java.util.Collection<net.minecraft.world.item.Item> white,
+	                       java.util.Collection<net.minecraft.world.item.Item> black) {
+		filterWhite.clear();
+		if (white != null) filterWhite.addAll(white);
+		filterBlack.clear();
+		if (black != null) filterBlack.addAll(black);
+	}
+
+	/**
+	 * 从存档恢复：接回上一次的任务和循环设置。
+	 *
+	 * <p>只恢复"任务定义"和"开关"，<b>不恢复进度</b>（走了多远、开过哪些箱子）。
+	 * 进度留在旧世界里没有意义，恢复它反而会导致"以为搬过其实没搬"。</p>
+	 */
+	public void restorePersisted(LootTask last, boolean repeatOn, int repeatInterval) {
+		if (last != null) {
+			this.lastTask = last;
+		}
+		if (repeatOn && last != null) {
+			this.repeatTask = last;
+			this.repeatIntervalTicks = Math.max(20, repeatInterval);
+			this.repeatEnabled = true;
+			// 0 表示"没有等待"——tick 里的「空闲且无待倒计时」分支会立刻开一轮
+			this.repeatWaitTicks = 0;
+			this.status = "已从存档恢复循环任务，稍后开始第一轮";
+		}
+	}
+
 	public boolean hasFilter() {
 		return !filterWhite.isEmpty() || !filterBlack.isEmpty();
 	}
