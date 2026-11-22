@@ -1,6 +1,6 @@
 # ContainerBot 构建与实现说明
 
-> 最后更新：v1.36.2
+> 最后更新：v1.38.0
 
 ## 目标环境
 
@@ -655,6 +655,89 @@ A\* 单次上限 30000 节点，远距离往返重复算很浪费。
 > ⚠️ **寻路缓存是保守设计**：起点按 4 格量化，所以命中时返回的路径可能从附近另一个格子开始。
 > 靠"首节点距离校验"兜底，最坏情况是多走几步，不会走错方向。
 > 如果你发现假人偶尔绕路，先把 `PATH_TTL_MS` 调小或直接 `invalidateCache()` 验证是不是缓存导致的。
+
+---
+
+## 失败自动重试（v1.37）
+
+**命令**：`/cbot retry <名字> on|off`（默认开启）
+
+| 失败原因 | 是否重试 | 理由 |
+|---|---|---|
+| 无法走到 / 无法规划 / 无法到达 | ✅ | 偶发（卡角落、区块刚加载），再来一次常能成 |
+| 打不开容器 | ✅ | 同上 |
+| 卡住 / 超时 | ✅ | 同上 |
+| **目的地已满** | ❌ | 重试一百次也一样，必须加箱子 |
+| **假人不存在** | ❌ | 人都没了，重试无意义 |
+
+**策略**：最多 2 次。第 1 次等 5 秒原样重来；第 2 次等 10 秒并**直接传送**到区域/目的地附近，绕过寻路。
+
+### ⚠️ 关键坑：重试逻辑放错地方等于没有
+
+第一版把重试写在 `completeTask()` 的失败分支里，实测**完全不触发**。
+
+原因：`fail()` 不走 `completeTask`——它只设置 `pendingFailureNotice`，由 `tick()` 发通知。
+所以**重试判断必须放在 tick 里处理 `pendingFailureNotice` 的那段**。
+
+```java
+if (pendingFailureNotice != null) {
+    String reason = pendingFailureNotice;
+    pendingFailureNotice = null;
+    LootTask failedTask = this.task != null ? this.task : lastTask;
+    if (retryEnabled && failedTask != null && retryCount < MAX_RETRIES && isRetryable(reason)) {
+        retryCount++;
+        retryTask = failedTask;
+        retryWaitTicks = 20 * 5 * retryCount;
+        ...
+    } else {
+        Notifier.taskFailed(server, name, reason);
+    }
+}
+```
+
+> 又一次印证：**同一件事在不同路径上有不同入口**。改行为前先确认你要改的那条路真的会执行到。
+
+### 传送兜底的安全校验
+
+第 2 次重试会传送到 `boxA`（区域角点）。但 `pos1` 记录的是**玩家站的位置**，
+常常就是脚下那块石头——直接传送过去会把假人闷死在方块里（实测就是这样把假人搞没的）。
+
+所以传送前先 `findSafeTeleportSpot()`：从基准点向**上**找 3 格、再向下找 3 格，
+取第一个 `canStandAt` 成立的坐标；找不到就放弃传送、老老实实重试。
+
+---
+
+## 重构：抽出 SurvivalKit（v1.38）
+
+`LootBot` 一度涨到 2325 行，状态机、寻路、卸货、音效、持久化全在里面。
+第一步先把**和状态机零耦合**的那块拆出去：
+
+| 抽出内容 | 行数 | 为什么安全 |
+|---|---|---|
+| `SurvivalKit`（饱食度维持 + 自动进食 + 测试钩子） | ~115 | 只碰 `FoodData` 和背包，不碰任务状态 |
+
+**做法**：`LootBot` 保留同名方法做**委托**，这样命令层、持久化层**一行都不用改**：
+
+```java
+public boolean isFeedEnabled() { return survival.isFeedEnabled(); }
+public void setFeedEnabled(boolean v) { survival.setFeedEnabled(v); }
+public void eatOnce(ServerPlayer bot, boolean force) { survival.eatOnce(bot, force); }
+```
+
+**注意**：`survival` 必须在构造器里初始化，不能用字段初始化器——
+`SurvivalKit` 需要假人名做诊断日志，而字段初始化时 `name` 还是 `null`。
+
+**结果**：2325 → 2210 行。
+
+### 后续可继续拆的（按耦合度从低到高）
+
+| 候选 | 内容 | 风险 |
+|---|---|---|
+| `DepositSelector` | 目的地选区 + 选箱 + 满箱记忆 | 低（只读世界，不改任务状态） |
+| `LifeStats` | 累计统计与格式化 | 极低（纯数据） |
+| `LootPhase` / `UnloadPhase` | 取货与卸货两段状态机 | **高**——和主循环共享大量字段，拆分要重新设计状态转移 |
+
+**建议**：前两个可以放心拆；第三个别急，先把行为测全再动。
 
 ---
 
