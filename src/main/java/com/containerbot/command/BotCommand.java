@@ -331,6 +331,13 @@ public final class BotCommand {
 				.then(Commands.literal("test")
 						.executes(BotCommand::selfTest))
 
+				// ---- 失败自动重试 ----
+				.then(Commands.literal("retry")
+						.then(Commands.argument("name", StringArgumentType.word())
+								.executes(BotCommand::retryInfo)
+								.then(Commands.literal("on").executes(ctx -> setRetry(ctx, true)))
+								.then(Commands.literal("off").executes(ctx -> setRetry(ctx, false)))))
+
 				// ---- 累计统计 ----
 				.then(Commands.literal("total")
 						.executes(BotCommand::totalAll)
@@ -1399,6 +1406,37 @@ public final class BotCommand {
 					+ "\n" + bot.describeLifeStats());
 		}
 		return bots.size();
+	}
+
+	// ------------------------------------------------------------------ 失败自动重试
+
+	private static int setRetry(CommandContext<CommandSourceStack> ctx, boolean on) {
+		CommandSourceStack src = ctx.getSource();
+		String name = StringArgumentType.getString(ctx, "name");
+		LootBot bot = BotManager.get(name);
+		if (bot == null) {
+			src.sendFailure(Component.literal("没有该假人的记录: " + name));
+			return 0;
+		}
+		bot.setRetryEnabled(on);
+		src.sendSuccess(() -> Component.literal((on ? "已开启 " : "已关闭 ") + name
+				+ " 的失败自动重试"
+				+ (on ? "（寻路失败/卡住/打不开容器 会自动重试，最多 2 次，第 2 次直接传送兜底）" : "")), true);
+		return 1;
+	}
+
+	private static int retryInfo(CommandContext<CommandSourceStack> ctx) {
+		CommandSourceStack src = ctx.getSource();
+		String name = StringArgumentType.getString(ctx, "name");
+		LootBot bot = BotManager.get(name);
+		if (bot == null) {
+			src.sendFailure(Component.literal("没有该假人的记录: " + name));
+			return 0;
+		}
+		src.sendSuccess(() -> Component.literal(name + " 失败自动重试: "
+				+ (bot.isRetryEnabled() ? "开启（默认）" : "关闭")
+				+ "，已重试 " + bot.getRetryCount() + " 次；用 /cbot retry " + name + " on|off 切换"), false);
+		return 1;
 	}
 
 	/** 累计统计：单个假人 */

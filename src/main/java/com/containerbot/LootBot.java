@@ -114,7 +114,76 @@ public class LootBot {
 	 */
 	private int baselineForTask = -1;
 
-	// ---------------- 累计统计（跨任务、跨重启） ----------------
+	// ---------------- 失败自动重试 ----------------
+
+	/** 是否开启失败自动重试（默认开） */
+	private volatile boolean retryEnabled = true;
+	/** 最多自动重试几次 */
+	private static final int MAX_RETRIES = 2;
+
+	private LootTask retryTask;
+	private int retryWaitTicks;
+	private int retryCount;
+
+	public boolean isRetryEnabled() {
+		return retryEnabled;
+	}
+
+	public void setRetryEnabled(boolean v) {
+		retryEnabled = v;
+	}
+
+	public int getRetryCount() {
+		return retryCount;
+	}
+
+	/**
+	 * 这个失败值得重试吗？
+	 *
+	 * <p>「目的地满了」「假人没了」这类重试一百次也一样，必须直接报错；
+	 * 而寻路失败、卡住、打不开容器往往是偶发的（假人卡在角落、区块刚加载），值得再来一次。</p>
+	 */
+	private static boolean isRetryable(String reason) {
+		if (reason == null || reason.isEmpty()) return false;
+		// 重试也没用的
+		if (reason.contains("目的地") && (reason.contains("满") || reason.contains("倒"))) return false;
+		if (reason.contains("假人不存在") || reason.contains("未指定")) return false;
+		// 值得重试的
+		return reason.contains("无法走到") || reason.contains("无法规划")
+				|| reason.contains("无法到达") || reason.contains("打不开")
+				|| reason.contains("卡") || reason.contains("超时");
+	}
+
+	/** 用户主动下任务时重置重试计数 */
+	public void resetRetry() {
+		this.retryTask = null;
+		this.retryWaitTicks = 0;
+		this.retryCount = 0;
+	}
+
+	/**
+	 * 从给定坐标往上下各找几格，挑一个「脚下实心、身位可通行」的位置。
+	 *
+	 * <p>因为区域角点经常是玩家站在地面上时记录的，/cbot pos1 很可能就是脚下那块石头——
+	 * 直接传送过去会把假人闷死在方块里。</p>
+	 *
+	 * @return 安全坐标；找不到返回 null
+	 */
+	private static BlockPos findSafeTeleportSpot(ServerLevel level, BlockPos base) {
+		if (base == null) return null;
+		// 先看原坐标和它上方（玩家设点时更可能站在上方）
+		for (int dy = 1; dy <= 3; dy++) {
+			BlockPos p = base.above(dy);
+			if (PathPlanner.canStandAt(level, p)) return p;
+		}
+		if (PathPlanner.canStandAt(level, base)) return base;
+		// 再向下找（角点可能是天花板）
+		for (int dy = 1; dy <= 3; dy++) {
+			BlockPos p = base.below(dy);
+			if (PathPlanner.canStandAt(level, p)) return p;
+		}
+		return null;
+	}
 
 	/** 累计搬运件数 */
 	private long lifeMoved;
@@ -397,35 +466,46 @@ public class LootBot {
 	/** 本次任务的简短描述 */
 	private String lastTaskDesc = "（尚未执行任务）";
 
-	// ---------------- 自动进食 ----------------
-
-	/** 饥饿值低于此值就吃东西（20 = 满，18 = 掉了两格） */
-	private static final int EAT_THRESHOLD = 18;
-	/** 是否开启自动进食（默认开启） */
-	private volatile boolean eatEnabled = true;
+	// ---------------- 生存维持（委托给 SurvivalKit） ----------------
 
 	/**
-	 * 是否开启「维持饱食度」（默认<b>开启</b>）。
+	 * 饱食度维持 + 自动进食。
 	 *
-	 * <p>直接操作 {@code FoodData}，把饥饿值补满。与 {@code eat} 的分工：</p>
-	 * <ul>
-	 *   <li>{@code eat} = <b>默认行为</b>（默认开启），让假人像真人一样吃东西</li>
-	 *   <li>{@code feed} = <b>可选兜底</b>（默认关闭），直接维持饱食度，
-	 *       相当于"作弊式保命"——想开就自己开</li>
-	 * </ul>
-	 *
-	 * <p>副作用是好的：饥饿值 ≥ 18 会触发自然回血，假人残血也能慢慢恢复。</p>
+	 * <p>实现全部搬到 {@link SurvivalKit} 了——那块逻辑和搬货状态机零耦合，
+	 * 放在 2000 多行的主类里只会越来越难读。这里保留同名方法，
+	 * 让命令层与持久化层完全不用改动。</p>
 	 */
-	private volatile boolean feedEnabled;
+	private final SurvivalKit survival;
+
+	public boolean isEatEnabled() {
+		return survival.isEatEnabled();
+	}
+
+	public void setEatEnabled(boolean v) {
+		survival.setEatEnabled(v);
+	}
+
+	public boolean isFeedEnabled() {
+		return survival.isFeedEnabled();
+	}
+
+	public void setFeedEnabled(boolean v) {
+		survival.setFeedEnabled(v);
+	}
+
+	public void eatOnce(ServerPlayer bot, boolean force) {
+		survival.eatOnce(bot, force);
+	}
+
+	public int forceHunger(ServerPlayer bot, int food, float saturation) {
+		return survival.forceHunger(bot, food, saturation);
+	}
 
 	/**
 	 * 精确数量模式（默认关闭）。
 	 *
 	 * <p>取货时 {@code QUICK_MOVE} 是<b>整组搬</b>，要 32 个但箱里是 64 一组就会拿 64。
-	 * 开启本模式后，<b>超过剩余需求的那一组不会被搬</b>——保证<b>绝不超过</b>目标数量。</p>
-	 *
-	 * <p>代价：如果箱里只有"一组 64"而你要 32 个，它会一个都不拿（宁可少拿也不超额）。
-	 * 任务结束时仍会如实报告「只找到 X/Y，还差 Z」。</p>
+	 * 开启本模式后，会用鼠标分流<b>精确取出</b>所需数量（v1.28.0 起是真拆分）。</p>
 	 */
 	private volatile boolean exactEnabled;
 
@@ -435,132 +515,6 @@ public class LootBot {
 
 	public void setExactEnabled(boolean v) {
 		this.exactEnabled = v;
-	}
-
-	/** 饥饿值低于此值就补满 */
-	private static final int FEED_THRESHOLD = 18;
-	/** 补满后的饥饿值 */
-	private static final int FEED_TARGET = 20;
-	/** 补满后的饱和度 */
-	private static final float FEED_SATURATION = 5.0f;
-
-	public boolean isFeedEnabled() {
-		return feedEnabled;
-	}
-
-	public void setFeedEnabled(boolean v) {
-		feedEnabled = v;
-	}
-
-	/**
-	 * 测试钩子：把饥饿值人为打到指定值。
-	 *
-	 * <p>用途是<b>验证 feed 的实际效果</b>——正常途径造不出饥饿状态：
-	 * 玩家数据不能用 {@code /data merge} 改、创造模式不掉饥饿、
-	 * 新假人的 saturation 有 20 点厚缓冲。所以只能直接改 {@code FoodData}
-	 * 把假人"弄饿"，再看 feed 会不会自动补回来。</p>
-	 *
-	 * @return 设置前的饥饿值；假人不在线返回 -1
-	 */
-	public int forceHunger(ServerPlayer bot, int food, float saturation) {
-		if (bot == null || bot.isRemoved()) return -1;
-		var fd = bot.getFoodData();
-		int before = fd.getFoodLevel();
-		fd.setFoodLevel(food);
-		fd.setSaturation(saturation);
-		Diag.trace(null, name, "测试钩子：把饥饿值设为 " + food + "（原 " + before + "）");
-		return before;
-	}
-
-	/**
-	 * 维持饱食度。
-	 *
-	 * <p>用阈值触发（低于 18 才补），不做每 tick 的 set——因为同值会标脏并触发同步包，
-	 * 那样每 tick 都在发包，白白浪费带宽。</p>
-	 */
-	private void maybeFeed(ServerPlayer bot) {
-		if (!feedEnabled) return;
-		var fd = bot.getFoodData();
-		int level = fd.getFoodLevel();
-		if (level >= FEED_THRESHOLD) return;
-
-		fd.setFoodLevel(FEED_TARGET);
-		fd.setSaturation(FEED_SATURATION);
-		Diag.trace(null, name, "维持饱食度: " + level + " -> " + FEED_TARGET);
-	}
-
-	public boolean isEatEnabled() {
-		return eatEnabled;
-	}
-
-	public void setEatEnabled(boolean v) {
-		eatEnabled = v;
-	}
-
-	/**
-	 * 饿了就吃东西。
-	 *
-	 * <p>走原版「手持食物 + 使用」的路径：把食物切到主手，再调
-	 * {@code ServerPlayerGameMode.useItem}。之后原版会自己推进进食进度、
-	 * 消耗物品并恢复饥饿值——与真人吃东西完全同一条流程。</p>
-	 *
-	 * <p>注意假人进食需要站着不动约 1.6 秒，行走途中可能吃不完整，
-	 * 下一 tick 会重新开始。</p>
-	 */
-	private void maybeEat(ServerPlayer bot) {
-		if (!eatEnabled) return;
-		eatOnce(bot, false);
-	}
-
-	/**
-	 * 吃一次东西。
-	 *
-	 * @param force true 表示无视饥饿值与开关，强制吃（供 /cbot eat <名字> test 验证用）
-	 */
-	public void eatOnce(ServerPlayer bot, boolean force) {
-		var food = bot.getFoodData();
-		if (!force && food.getFoodLevel() >= EAT_THRESHOLD) return;
-		// 已经在吃了，等它完成
-		if (bot.isUsingItem()) return;
-
-		var inv = bot.getInventory();
-		int selected = inv.getSelectedSlot();
-
-		// 1) 快捷栏 + 主背包（0..35）——切到主手吃
-		for (int i = 0; i < 36; i++) {
-			ItemStack st = inv.getItem(i);
-			// 1.21 用数据组件判断是不是食物（没有 isEdible()）
-			if (st.isEmpty() || !st.has(net.minecraft.core.component.DataComponents.FOOD)) continue;
-
-			if (i < 9) {
-				// 在快捷栏：直接切到那一格
-				inv.setSelectedSlot(i);
-			} else {
-				// 在背包里：和当前选中的快捷栏槽位交换
-				ItemStack cur = inv.getItem(selected);
-				inv.setItem(i, cur);
-				inv.setItem(selected, st);
-			}
-
-			ItemStack held = bot.getMainHandItem();
-			bot.gameMode.useItem(bot, (ServerLevel) bot.level(), held, InteractionHand.MAIN_HAND);
-			Diag.trace(null, name, "自动进食: " + ItemNames.displayName(held.getItem())
-					+ " 饥饿值=" + food.getFoodLevel() + (force ? "（强制）" : ""));
-			return;
-		}
-
-		// 2) 副手（slot 40）——原版不会自动从副手吃，必须显式指定那只手。
-		//    主手和背包都没有食物时才回退到这里。
-		ItemStack off = bot.getOffhandItem();
-		if (!off.isEmpty() && off.has(net.minecraft.core.component.DataComponents.FOOD)) {
-			bot.gameMode.useItem(bot, (ServerLevel) bot.level(), off, InteractionHand.OFF_HAND);
-			Diag.trace(null, name, "自动进食（副手）: " + ItemNames.displayName(off.getItem())
-					+ " 饥饿值=" + food.getFoodLevel());
-			return;
-		}
-
-		// 没有食物可吃：不报错，只记录（避免刷屏）
-		Diag.trace(null, name, "饿了但没有食物（饥饿值=" + food.getFoodLevel() + "）");
 	}
 	/** 无法打开/无法到达而跳过的容器数 */
 	private int skippedContainers;
@@ -831,6 +785,9 @@ public class LootBot {
 
 	public LootBot(String name) {
 		this.name = name;
+		// survival 需要假人名做诊断日志，所以只能在构造器里初始化，
+		// 不能用字段初始化器（那时 name 还是 null）。
+		this.survival = new SurvivalKit(name);
 	}
 
 	public String getName() {
@@ -884,6 +841,8 @@ public class LootBot {
 	 * @return true 表示立即开始，false 表示已排入队列
 	 */
 	public boolean submit(MinecraftServer server, LootTask t) {
+		// 用户主动下任务：把之前的重试计数清掉，重新开始算
+		resetRetry();
 		if (task == null && (state == State.DONE || state == State.FAILED || state == State.SCAN)) {
 			beginTask(server, t);
 			return true;
@@ -1043,6 +1002,12 @@ public class LootBot {
 
 	private void completeTask(MinecraftServer server, ServerPlayer bot, boolean success, String reason) {
 		LootTask done = this.task;
+		// 成功即清零重试计数；失败时由下面的分支决定是否再试
+		if (success) {
+			retryCount = 0;
+			retryTask = null;
+			retryWaitTicks = 0;
+		}
 		// 累计统计：跨任务累计，并由 Persistence 存盘（重启不清零）
 		if (done != null) {
 			lifeMoved += Math.max(0, collectedForTask);
@@ -1069,7 +1034,18 @@ public class LootBot {
 				// 其它失败原因必须如实报出，否则会误导（曾经一律报"已搜遍"）
 				Notifier.taskShort(server, name, done, collectedForTask, containersSearched);
 			} else {
-				Notifier.taskFailed(server, name, reason == null ? "未知原因" : reason);
+				String why = reason == null ? "未知原因" : reason;
+				if (retryEnabled && done != null && retryCount < MAX_RETRIES && isRetryable(why)) {
+					retryCount++;
+					retryTask = done;
+					retryWaitTicks = 20 * 5 * retryCount;   // 第 1 次等 5 秒，第 2 次等 10 秒
+					final int sec = retryWaitTicks / 20;
+					final int n = retryCount;
+					Notifier.warn(server, name + " 遇到问题（" + why + "），"
+							+ sec + " 秒后自动重试（第 " + n + "/" + MAX_RETRIES + " 次）");
+				} else {
+					Notifier.taskFailed(server, name, why);
+				}
 			}
 		}
 		this.task = null;
@@ -1113,7 +1089,23 @@ public class LootBot {
 		if (pendingFailureNotice != null) {
 			String reason = pendingFailureNotice;
 			pendingFailureNotice = null;
-			Notifier.taskFailed(server, name, reason);
+
+			// 失败自动重试：必须在这里处理。
+			// fail() 走的是「挂起通知 + tick 里发」这条路，**根本不经过 completeTask**，
+			// 所以把重试逻辑只写在 completeTask 里是永远不会触发的（实测踩过）。
+			LootTask failedTask = this.task != null ? this.task : lastTask;
+			if (retryEnabled && failedTask != null && retryCount < MAX_RETRIES
+					&& isRetryable(reason)) {
+				retryCount++;
+				retryTask = failedTask;
+				retryWaitTicks = 20 * 5 * retryCount;   // 第 1 次等 5 秒，第 2 次等 10 秒
+				final int sec = retryWaitTicks / 20;
+				final int n = retryCount;
+				Notifier.warn(server, name + " 遇到问题（" + reason + "），"
+						+ sec + " 秒后自动重试（第 " + n + "/" + MAX_RETRIES + " 次）");
+			} else {
+				Notifier.taskFailed(server, name, reason);
+			}
 		}
 
 		ServerPlayer bot = server.getPlayerList().getPlayerByName(name);
@@ -1121,8 +1113,7 @@ public class LootBot {
 		// 自动进食/维持饱食度：放在任务状态机之前，空闲时也生效
 		if (bot != null && !bot.isRemoved()) {
 			seenOnline = true;
-			maybeFeed(bot);
-			maybeEat(bot);
+			survival.tick(bot);
 		} else if (seenOnline) {
 			// 假人下线：自动重新标记为「有任务」，避免下次被误当成空闲
 			seenOnline = false;
@@ -1141,6 +1132,31 @@ public class LootBot {
 				fail("假人生成超时");
 			}
 			return;
+		}
+
+		// 失败自动重试：等待倒计时（同样必须放在 `task == null` 的提前返回之前）
+		if (retryWaitTicks > 0) {
+			retryWaitTicks--;
+			if (retryWaitTicks <= 0 && retryTask != null) {
+				LootTask t = retryTask;
+				retryTask = null;
+				// 第二次重试时不再指望寻路：直接把假人送到区域/目的地附近
+				if (retryCount >= 2 && bot != null) {
+					BlockPos near = t.isBoxMode() ? t.boxA() : t.deposit();
+					// 防御：区域角点常常设在地面层（石头里），直接传送过去会闷死。
+					// 先找附近一个真能站的位置，找不到就放弃传送、老老实实重试。
+					BlockPos safe = findSafeTeleportSpot((ServerLevel) bot.level(), near);
+					if (safe != null) {
+						teleportNear(bot, safe);
+						Diag.trace(server, name, "重试 #" + retryCount + "：传送到 " + fmt(safe));
+					} else {
+						Diag.trace(server, name, "重试 #" + retryCount + "：附近没有安全落脚点，跳过传送");
+					}
+				}
+				Diag.trace(server, name, "自动重试第 " + retryCount + " 次开始");
+				beginTask(server, t);
+			}
+			if (retryWaitTicks > 0) return;
 		}
 
 		// 循环任务：两轮之间的等待。
