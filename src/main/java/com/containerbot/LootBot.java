@@ -113,6 +113,99 @@ public class LootBot {
 	 * 那时还没开始取货，所以取到的就是"原本就有多少"。</p>
 	 */
 	private int baselineForTask = -1;
+
+	// ---------------- 目的地选区（目的箱轮转） ----------------
+
+	/** 目的地选区的两个角点；都为 null 表示使用任务里的单点目的地 */
+	private BlockPos depositAreaA;
+	private BlockPos depositAreaB;
+	private ResourceKey<Level> depositAreaDim;
+
+	/** 当前正在用的目的箱（选区模式下动态选出） */
+	private BlockPos chosenDeposit;
+
+	/** 本次任务里已经确认装满、不要再选的箱子 */
+	private final java.util.Set<BlockPos> fullDeposits = new HashSet<>();
+
+	public void setDepositArea(BlockPos a, BlockPos b, ResourceKey<Level> dim) {
+		this.depositAreaA = a == null ? null : a.immutable();
+		this.depositAreaB = b == null ? null : b.immutable();
+		this.depositAreaDim = dim;
+		this.chosenDeposit = null;
+		this.fullDeposits.clear();
+	}
+
+	public void clearDepositArea() {
+		this.depositAreaA = null;
+		this.depositAreaB = null;
+		this.depositAreaDim = null;
+		this.chosenDeposit = null;
+		this.fullDeposits.clear();
+	}
+
+	public boolean hasDepositArea() {
+		return depositAreaA != null && depositAreaB != null;
+	}
+
+	public BlockPos getDepositAreaA() {
+		return depositAreaA;
+	}
+
+	public BlockPos getDepositAreaB() {
+		return depositAreaB;
+	}
+
+	public ResourceKey<Level> getDepositAreaDim() {
+		return depositAreaDim;
+	}
+
+	/**
+	 * 本次卸货该用哪个容器。
+	 *
+	 * <p>单点模式直接用任务里的目的地；选区模式则在区域内挑一个<b>还有空位</b>的容器，
+	 * 装满后自动换下一个。</p>
+	 *
+	 * @return 目标容器坐标；选区模式下全部装满时返回 null
+	 */
+	private BlockPos depositOf(ServerLevel level) {
+		if (!hasDepositArea()) {
+			return task.hasDeposit() ? task.deposit() : null;
+		}
+
+		// 当前选中的还能用就继续用
+		if (chosenDeposit != null && !fullDeposits.contains(chosenDeposit)
+				&& hasFreeSlot(level, chosenDeposit)) {
+			return chosenDeposit;
+		}
+
+		for (BlockPos p : ContainerScanner.scanBox(level, depositAreaA, depositAreaB)) {
+			if (fullDeposits.contains(p)) continue;
+			if (!(level.getBlockEntity(p) instanceof Container c)) continue;
+			if (!hasFreeSlot(c)) {
+				fullDeposits.add(p);
+				continue;
+			}
+			chosenDeposit = p;
+			return p;
+		}
+		return null;
+	}
+
+	private static boolean hasFreeSlot(Container c) {
+		for (int i = 0; i < c.getContainerSize(); i++) {
+			if (c.getItem(i).isEmpty()) return true;
+		}
+		return false;
+	}
+
+	private static boolean hasFreeSlot(ServerLevel level, BlockPos p) {
+		return level.getBlockEntity(p) instanceof Container c && hasFreeSlot(c);
+	}
+
+	/** 卸货目标的维度：选区模式用选区的维度，否则用任务里的 */
+	private ResourceKey<Level> depositDimOf() {
+		return hasDepositArea() ? depositAreaDim : task.depositDim();
+	}
 	/**
 	 * 已经卸货出去的件数。
 	 *
@@ -755,6 +848,17 @@ public class LootBot {
 		return n;
 	}
 
+	/** 手动停止后覆盖文案（clearAll 会写成「任务已清空」） */
+	public void markStopped() {
+		this.state = State.DONE;
+		this.status = "已被手动停止";
+		this.openContainer = null;
+		this.navigator = null;
+		// 手动停止是人主动做的，不该再弹「任务失败」告警和音效
+		this.pendingFailureNotice = null;
+		ContainerClaims.releaseAll(name);
+	}
+
 	/** 只清空排队中的任务，保留正在执行的 */
 	public int clearQueue() {
 		int n = queue.size();
@@ -762,8 +866,7 @@ public class LootBot {
 		return n;
 	}
 
-	public void fail(String reason) {
-		this.state = State.FAILED;
+	public void fail(String reason) {		this.state = State.FAILED;
 		this.status = reason;
 		this.log.add("失败: " + reason);
 		// 失败即归还所有容器认领，否则别的假人会一直跳过这些箱子
@@ -1510,9 +1613,18 @@ public class LootBot {
 		if (menu == null || menu == bot.inventoryMenu || openContainer == null) {
 			// 优先使用玩家指定的卸货箱/搬家目的地；
 			// 只有在没指定时才退化为「自动找附近容器」。
-			BlockPos dump = task.hasDeposit() ? task.deposit() : findDumpTarget(level, bot);
+			BlockPos dump;
+			if (hasDepositArea()) {
+				dump = depositOf(level);
+			} else if (task.hasDeposit()) {
+				dump = task.deposit();
+			} else {
+				dump = findDumpTarget(level, bot);
+			}
 			if (dump == null) {
-				fail("背包已满且找不到可卸货的容器（用 /cbot deposit 指定一个）");
+				fail(hasDepositArea()
+						? "目的地选区内的容器已全部装满，没法继续倒货"
+						: "背包已满且找不到可卸货的容器（用 /cbot deposit 指定一个）");
 				return;
 			}
 
@@ -1521,22 +1633,23 @@ public class LootBot {
 			//
 			// 诊断先行：上一轮加了诊断才发现这条分支从未被执行，
 			// 而前 6 个版本都在盲改它内部的代码。这里把实际取值打出来。
-			Diag.trace(server, name, "卸货点维度检查: 目的=" + task.depositDim()
+			Diag.trace(server, name, "卸货点维度检查: 目的=" + depositDimOf()
 					+ " 当前=" + level.dimension()
-					+ " 需要传送=" + (task.depositDim() != null
-							&& !level.dimension().equals(task.depositDim()))
+					+ " 需要传送=" + (depositDimOf() != null
+							&& !level.dimension().equals(depositDimOf()))
 					+ " 卸货点=" + fmt(dump)
+					+ " 选区模式=" + hasDepositArea()
 					+ " 假人=" + fmt(bot.blockPosition()));
 
-			if (task.depositDim() != null && !level.dimension().equals(task.depositDim())) {
+			if (depositDimOf() != null && !level.dimension().equals(depositDimOf())) {
 				// 记住出发地，卸完货要回来接着搬
 				if (returnDim == null) {
 					returnDim = level.dimension();
 					returnPos = bot.blockPosition();
 				}
-				teleportToDim(server, task.depositDim(),
+				teleportToDim(server, depositDimOf(),
 						dump.getX() + 0.5, dump.getY() + 1.0, dump.getZ() + 0.5);
-				status = "已传送到 " + task.depositDim().location() + " 卸货";
+				status = "已传送到 " + depositDimOf().location() + " 卸货";
 				stateTicks = 0;
 				unloadRounds++;
 				return;   // 下一 tick 在新维度里重新走向容器
@@ -1583,6 +1696,23 @@ public class LootBot {
 		closeContainer(bot);
 
 		if (!movedAny) {
+			// 目的地选区模式：这箱满了就换下一个，别让整个任务失败。
+			// 判定条件带上 before > 0 —— 背包里本来就没货的话不算"箱子满"。
+			if (hasDepositArea() && before > 0) {
+				BlockPos used = dumpPos;
+				if (used != null) {
+					fullDeposits.add(used);
+					Diag.trace(server, name, "目的地已满，标记并换下一个: " + fmt(used));
+				}
+				chosenDeposit = null;
+				container = null;
+				openContainer = null;
+				unloadRounds = 0;      // 换箱子是进展，不是连续失败
+				state = State.UNLOAD;
+				stateTicks = 0;
+				status = "目的地已满，换下一个容器";
+				return;
+			}
 			// 搬家模式下卸货箱已满也属于「倒不进去」，直接明确报错
 			fail(task.moveAll() ? "目的地容器已满，无法继续倒货" : "背包已满且无法把货物倒进容器");
 			return;
@@ -1607,14 +1737,49 @@ public class LootBot {
 			status = "卸货完成（已交付 " + deliveredCount + "），继续搬运";
 		}
 
-		// 收尾卸货：尾货已送达，任务才算真正完成
+		// 收尾卸货：必须确认背包真的空了才算送达
 		if (flushing) {
-			completeTask(server, bot, true, "所有容器已掏空，货物已送达目的地");
+			tryFinishFlush(server, bot);
 			return;
 		}
 
 		state = State.SCAN;
 		stateTicks = 0;
+	}
+
+	/**
+	 * 收尾卸货的判断：<b>背包真的空了才算送达</b>。
+	 *
+	 * <p>踩过的坑：原先只要 {@code flushing} 就直接 completeTask 报「货物已送达」，
+	 * 结果目的地箱子满了、假人身上还揣着 256 个钻石，任务照样宣称成功。</p>
+	 *
+	 * @return 恒为 true（表示本轮已处理完，调用方直接 return）
+	 */
+	private boolean tryFinishFlush(MinecraftServer server, ServerPlayer bot) {
+		int left = countAllItems(bot);
+		if (left <= 0) {
+			completeTask(server, bot, true, "所有容器已掏空，货物已送达目的地");
+			return true;
+		}
+
+		// 还有货没倒完 → 目的地选区模式换下一个箱子继续倒
+		if (hasDepositArea()) {
+			BlockPos next = depositOf((ServerLevel) bot.level());
+			if (next != null) {
+				chosenDeposit = next;
+				container = null;
+				openContainer = null;
+				unloadRounds = 0;
+				state = State.UNLOAD;
+				stateTicks = 0;
+				status = "还有 " + left + " 件没倒完，换下一个目的箱";
+				Diag.trace(server, name, "收尾换箱: 剩 " + left + " 件 → " + fmt(next));
+				return true;
+			}
+		}
+
+		fail("目的地已满，还有 " + left + " 件没倒出去（加箱子或扩大目的地选区）");
+		return true;
 	}
 
 	/** 卸货完成、跨维度时用来回到出发地 */
@@ -1739,7 +1904,7 @@ public class LootBot {
 		}
 
 		if (flushing) {
-			completeTask(server, bot, true, "所有容器已掏空，货物已送达目的地");
+			tryFinishFlush(server, bot);
 			return;
 		}
 

@@ -76,6 +76,11 @@ public final class BotCommand {
 	/** 每个玩家指定的卸货箱（背包满时货物倒进这里） */
 	private static final Map<UUID, BlockPos> DEPOSITS = new HashMap<>();
 
+	/** 目的地选区（目的箱轮转）的两个角点与维度 */
+	private static final Map<UUID, BlockPos> DPOS_A = new HashMap<>();
+	private static final Map<UUID, BlockPos> DPOS_B = new HashMap<>();
+	private static final Map<UUID, ResourceKey<Level>> DPOS_DIM = new HashMap<>();
+
 	/** 卸货点所在维度。为空表示与假人当前维度相同 */
 	private static final Map<UUID, ResourceKey<Level>> DEPOSIT_DIMS = new HashMap<>();
 
@@ -217,6 +222,19 @@ public final class BotCommand {
 						.then(Commands.literal("clear")
 								.executes(BotCommand::clearDeposit)))
 
+				// ---- 目的地选区（目的箱轮转）----
+				// 框出一个区域，假人会把货轮流倒进区域里的容器，装满一个自动换下一个。
+				.then(Commands.literal("dpos1")
+						.executes(ctx -> setDepositAreaPoint(ctx, true))
+						.then(dposArgs(0)))
+				.then(Commands.literal("dpos2")
+						.executes(ctx -> setDepositAreaPoint(ctx, false))
+						.then(dposArgs(1)))
+				.then(Commands.literal("depot")
+						.executes(BotCommand::depositAreaInfo)
+						.then(Commands.literal("clear")
+								.executes(BotCommand::clearDepositArea)))
+
 				// ---- 搬家模式 ----
 				// 掏空选定区域（或半径内）的所有容器，全部倒进指定目的地。
 				// 必须先用 /cbot deposit 指定目的地。
@@ -312,6 +330,12 @@ public final class BotCommand {
 
 				.then(Commands.literal("test")
 						.executes(BotCommand::selfTest))
+
+				// ---- 音效 ----
+				.then(Commands.literal("sound")
+						.executes(BotCommand::soundInfo)
+						.then(Commands.literal("on").executes(ctx -> setSound(ctx, true)))
+						.then(Commands.literal("off").executes(ctx -> setSound(ctx, false))))
 
 				// ---- 任务持久化（重启后恢复）----
 				.then(Commands.literal("persist")
@@ -900,6 +924,153 @@ public final class BotCommand {
 		src.sendSuccess(() -> Component.literal(name + " 精确数量模式: "
 				+ (bot.isExactEnabled() ? "开启" : "关闭（默认）")
 				+ "；用 /cbot exact " + name + " on|off 切换"), false);
+		return 1;
+	}
+
+	// ------------------------------------------------------------------ 目的地选区
+
+	/** 坐标形式的参数树：&lt;x&gt; &lt;y&gt; &lt;z&gt; [维度]（控制台也能用） */
+	private static ArgumentBuilder<CommandSourceStack, ?> dposArgs(int index) {
+		return Commands.argument("x", IntegerArgumentType.integer(-30_000_000, 30_000_000))
+				.then(Commands.argument("y", IntegerArgumentType.integer(-2048, 2048))
+						.then(Commands.argument("z", IntegerArgumentType.integer(-30_000_000, 30_000_000))
+								.executes(ctx -> setDepositAreaPointAt(ctx, index))
+								.then(Commands.argument("dim", StringArgumentType.word())
+										.executes(ctx -> setDepositAreaPointAt(ctx, index)))));
+	}
+
+	/** 用显式坐标设目的地选区角点 */
+	private static int setDepositAreaPointAt(CommandContext<CommandSourceStack> ctx, int index) {
+		CommandSourceStack src = ctx.getSource();
+		BlockPos p = new BlockPos(
+				IntegerArgumentType.getInteger(ctx, "x"),
+				IntegerArgumentType.getInteger(ctx, "y"),
+				IntegerArgumentType.getInteger(ctx, "z"));
+
+		ServerPlayer player = src.getPlayer();
+		ResourceKey<Level> dim = player != null ? player.level().dimension() : Level.OVERWORLD;
+		String dimStr = null;
+		try {
+			dimStr = StringArgumentType.getString(ctx, "dim");
+		} catch (IllegalArgumentException ignored) {
+			// 未给维度
+		}
+		if (dimStr != null) {
+			ResourceLocation id = ResourceLocation.tryParse(
+					dimStr.indexOf(':') >= 0 ? dimStr : "minecraft:" + dimStr);
+			if (id == null) {
+				src.sendFailure(Component.literal("维度 ID 无效: " + dimStr));
+				return 0;
+			}
+			dim = ResourceKey.create(Registries.DIMENSION, id);
+		}
+		return applyDepositAreaPoint(src, index, p, dim);
+	}
+
+	private static int setDepositAreaPoint(CommandContext<CommandSourceStack> ctx, boolean first) {
+		CommandSourceStack src = ctx.getSource();
+		ServerPlayer player = src.getPlayer();
+		if (player == null) {
+			src.sendFailure(Component.literal("控制台没有位置概念，请用 /cbot dpos"
+					+ (first ? "1" : "2") + " <x> <y> <z> [维度]"));
+			return 0;
+		}
+		BlockPos pos;
+		HitResult hit = player.pick(6.0, 1.0f, false);
+		if (hit instanceof BlockHitResult blockHit && hit.getType() == HitResult.Type.BLOCK) {
+			pos = blockHit.getBlockPos();
+		} else {
+			pos = player.blockPosition();
+		}
+		return applyDepositAreaPoint(src, first ? 0 : 1, pos, player.level().dimension());
+	}
+
+	private static int applyDepositAreaPoint(CommandSourceStack src, int index, BlockPos pos,
+	                                         ResourceKey<Level> dim) {
+		UUID owner = key(src);
+		if (index == 0) {
+			DPOS_A.put(owner, pos.immutable());
+		} else {
+			DPOS_B.put(owner, pos.immutable());
+		}
+		if (dim != null) {
+			DPOS_DIM.put(owner, dim);
+		}
+
+		BlockPos a = DPOS_A.get(owner);
+		BlockPos b = DPOS_B.get(owner);
+		boolean complete = a != null && b != null;
+		if (complete) {
+			// 同时占住单点目的地，好让「搬家必须先指定目的地」的校验通过。
+			// 实际卸货走的是选区逻辑，这个坐标只是个占位。
+			DEPOSITS.put(owner, a);
+			DEPOSIT_DROP.put(owner, Boolean.FALSE);
+		}
+
+		final String state = complete
+				? "选区完整 " + describeBox(a, b) + "，下次 /cbot move 或 /cbot start 生效"
+				: "还需设另一个角点";
+		final String msg = "已设目的地角点" + (index + 1) + " " + fmt(pos) + "；" + state;
+		src.sendSuccess(() -> Component.literal(msg), true);
+		return 1;
+	}
+
+	private static int clearDepositArea(CommandContext<CommandSourceStack> ctx) {
+		CommandSourceStack src = ctx.getSource();
+		UUID owner = key(src);
+		DPOS_A.remove(owner);
+		DPOS_B.remove(owner);
+		DPOS_DIM.remove(owner);
+		// 连带清掉那个占位目的地，否则会指向一个角点坐标（不是容器）
+		DEPOSITS.remove(owner);
+		src.sendSuccess(() -> Component.literal("已清除目的地选区，回到单点目的地模式"), true);
+		return 1;
+	}
+
+	private static int depositAreaInfo(CommandContext<CommandSourceStack> ctx) {
+		CommandSourceStack src = ctx.getSource();
+		UUID owner = key(src);
+		BlockPos a = DPOS_A.get(owner);
+		BlockPos b = DPOS_B.get(owner);
+		if (a == null || b == null) {
+			src.sendSuccess(() -> Component.literal(
+					"目的地选区: 未设置（用 /cbot dpos1 + /cbot dpos2 框选，货会轮流倒进区域内的容器）"), false);
+			return 1;
+		}
+		final String msg = "目的地选区: " + describeBox(a, b)
+				+ "（维度 " + DPOS_DIM.get(owner) + "）；一个箱子装满会自动换下一个";
+		src.sendSuccess(() -> Component.literal(msg), false);
+		return 1;
+	}
+
+	/** 把命令源的目的地选区同步给假人；没设选区则清掉 */
+	private static void applyDepositArea(CommandSourceStack src, LootBot bot) {
+		UUID owner = key(src);
+		BlockPos a = DPOS_A.get(owner);
+		BlockPos b = DPOS_B.get(owner);
+		if (a != null && b != null) {
+			bot.setDepositArea(a, b, DPOS_DIM.get(owner));
+		} else {
+			bot.clearDepositArea();
+		}
+	}
+
+	// ------------------------------------------------------------------ 音效
+
+	private static int setSound(CommandContext<CommandSourceStack> ctx, boolean on) {
+		CommandSourceStack src = ctx.getSource();
+		com.containerbot.Notifier.setSoundEnabled(on);
+		src.sendSuccess(() -> Component.literal(on
+				? "已开启任务音效（完成=叮 · 数量不足=两声「不行」 · 目的地满=三声钟 · 卡住=重击）"
+				: "已关闭任务音效"), true);
+		return 1;
+	}
+
+	private static int soundInfo(CommandContext<CommandSourceStack> ctx) {
+		CommandSourceStack src = ctx.getSource();
+		boolean on = com.containerbot.Notifier.isSoundEnabled();
+		src.sendSuccess(() -> Component.literal("任务音效: " + (on ? "开启（默认）" : "关闭")
+				+ "；用 /cbot sound on|off 切换"), false);
 		return 1;
 	}
 
@@ -1769,6 +1940,9 @@ public final class BotCommand {
 		depositDim = DEPOSIT_DIMS.get(key(src));
 		dropMode = Boolean.TRUE.equals(DEPOSIT_DROP.get(key(src)));
 
+		// 目的箱轮转：把目的地选区同步给假人（没设就清掉，回到单点模式）
+		applyDepositArea(src, bot);
+
 		bot.submit(src.getServer(), LootTask.loot(item, count, radius > 0 ? radius : 32,
 				boxA, boxB, boxDim, Math.max(0, shulkerThreshold), deposit, depositDim, dropMode,
 				PACES.getOrDefault(key(src), 0), RATES.getOrDefault(key(src), 0),
@@ -1848,6 +2022,8 @@ public final class BotCommand {
 				deposit, depositDim, dropMode,
 				PACES.getOrDefault(owner, 0), RATES.getOrDefault(owner, 0),
 				List.copyOf(bot.getFilterWhite()));
+		// 目的箱轮转：把目的地选区同步给假人（没设就清掉，回到单点模式）
+		applyDepositArea(src, bot);
 		bot.submit(src.getServer(), t);
 
 		final BlockPos dp = deposit;
@@ -1894,7 +2070,12 @@ public final class BotCommand {
 			src.sendFailure(Component.literal("没有该假人的记录: " + name));
 			return 0;
 		}
+		// 注意：不能只调 fail()。fail() 只改状态、不清 task，
+		// 之后 unavailableReason() 仍会报「正在执行任务」，
+		// 导致 /cbot goto 和重新下任务全被拒绝（实测踩过）。
 		bot.fail("已被手动停止");
+		bot.clearAll();     // 清空 task/队列/循环，并释放容器认领
+		bot.markStopped();  // 覆盖 clearAll 的「任务已清空」文案
 		src.sendSuccess(() -> Component.literal("已停止 " + name), true);
 		return 1;
 	}

@@ -18,7 +18,54 @@ import net.minecraft.server.MinecraftServer;
  */
 public final class Notifier {
 
+	// ---------------- 音效 ----------------
+
+	/** 音效总开关（默认开） */
+	private static volatile boolean soundEnabled = true;
+
+	public static boolean isSoundEnabled() {
+		return soundEnabled;
+	}
+
+	public static void setSoundEnabled(boolean v) {
+		soundEnabled = v;
+	}
+
+	// 注意：1.21 里部分音效是 Holder<SoundEvent>（如音符盒），部分是裸 SoundEvent。
+	// 用错会造成 "找不到符号 value()" 之类的编译错误。
+	private static final net.minecraft.sounds.SoundEvent SND_DONE =
+			net.minecraft.sounds.SoundEvents.NOTE_BLOCK_PLING.value();
+	private static final net.minecraft.sounds.SoundEvent SND_FAIL =
+			net.minecraft.sounds.SoundEvents.VILLAGER_NO;
+	private static final net.minecraft.sounds.SoundEvent SND_FULL =
+			net.minecraft.sounds.SoundEvents.NOTE_BLOCK_BELL.value();
+	private static final net.minecraft.sounds.SoundEvent SND_STUCK =
+			net.minecraft.sounds.SoundEvents.ANVIL_LAND;
+
 	private Notifier() {}
+
+	/**
+	 * 给所有在线玩家放音效。
+	 *
+	 * <p>做法是「在每个玩家自己的位置放一次」——这样无论人在哪都听得见，
+	 * 挂机时人往往不在假人旁边，按距离衰减就会漏掉。</p>
+	 */
+	private static void playForAll(MinecraftServer server,
+	                               net.minecraft.sounds.SoundEvent sound,
+	                               float volume, float pitch, int times) {
+		if (server == null || !soundEnabled || sound == null) return;
+		try {
+			var players = server.getPlayerList().getPlayers();
+			for (int k = 0; k < times; k++) {
+				for (var p : players) {
+					p.level().playSound(null, p.getX(), p.getY(), p.getZ(),
+							sound, net.minecraft.sounds.SoundSource.MASTER, volume, pitch);
+				}
+			}
+		} catch (Throwable ignored) {
+			// 音效失败绝不能影响任务
+		}
+	}
 
 	public static void info(MinecraftServer server, String text) {
 		send(server, Component.literal("[ContainerBot] ").withStyle(ChatFormatting.GOLD)
@@ -69,25 +116,46 @@ public final class Notifier {
 
 	/** 完成 */
 	public static void taskDone(MinecraftServer server, String botName, LootTask task, int have, boolean queuedMore) {
+		// 完成音：清脆一声，不吵
+		playForAll(server, SND_DONE, 1.0f, 1.2f, 1);
+		String tip = queuedMore ? "，继续执行下一个任务…" : "";
 		if (task.moveAll()) {
-			success(server, botName + " 搬家完成：共搬走 " + have + " 件物品（区域内容器已全部掏空）"
-					+ (queuedMore ? "，继续执行下一个任务…" : ""));
+			success(server, "✔ " + botName + " 搬家完成：共搬走 " + have + " 件物品（区域内容器已全部掏空）" + tip);
 			return;
 		}
-		success(server, botName + " 完成：已收集 " + have + "/" + task.count() + " 个 " + task.itemName()
-				+ (queuedMore ? "，继续执行下一个任务…" : ""));
+		success(server, "✔ " + botName + " 完成：已收集 " + have + "/" + task.count() + " 个 "
+				+ task.itemName() + tip);
 	}
 
 	/** 失败：数量不足 */
 	public static void taskShort(MinecraftServer server, String botName, LootTask task, int have, int searched) {
-		warn(server, botName + " 结束：范围内容器已搜遍（共 " + searched + " 个），"
+		// 数量不足属于"没干完"，用警示音
+		playForAll(server, SND_FAIL, 1.0f, 0.9f, 2);
+		warn(server, "! " + botName + " 结束：范围内容器已搜遍（共 " + searched + " 个），"
 				+ task.itemName() + " 只找到 " + have + "/" + task.count()
 				+ "，还差 " + (task.count() - have) + " 个");
 	}
 
-	/** 失败：其它原因 */
+	/**
+	 * 失败：其它原因。
+	 *
+	 * <p>按原因选不同音效——挂机时听声音就能判断是「要你去加箱子」还是「出故障了」。</p>
+	 */
 	public static void taskFailed(MinecraftServer server, String botName, String reason) {
-		error(server, botName + " 任务失败：" + reason);
+		String r = reason == null ? "" : reason;
+		if (r.contains("目的地") && (r.contains("满") || r.contains("倒"))) {
+			// 目的地不足：钟声连响三下，最需要人工介入的一类
+			playForAll(server, SND_FULL, 1.2f, 1.4f, 3);
+			error(server, "✖ " + botName + " 目的地不足：" + r);
+			return;
+		}
+		if (r.contains("无法走到") || r.contains("卡") || r.contains("超时")) {
+			playForAll(server, SND_STUCK, 1.2f, 0.9f, 1);
+			error(server, "✖ " + botName + " 卡住了：" + r);
+			return;
+		}
+		playForAll(server, SND_FAIL, 1.0f, 0.9f, 2);
+		error(server, "✖ " + botName + " 任务失败：" + r);
 	}
 
 	private static void send(MinecraftServer server, Component msg) {

@@ -82,6 +82,9 @@ public final class Persistence {
 		public int repeatIntervalTicks;
 		public List<String> white = new ArrayList<>();
 		public List<String> black = new ArrayList<>();
+		/** 目的地选区（目的箱轮转）；都为空表示单点目的地 */
+		public int[] dposA, dposB;
+		public String dposDim;
 		/** 最近一次任务的完整定义（循环恢复要用它） */
 		public TaskState lastTask;
 	}
@@ -225,6 +228,14 @@ public final class Persistence {
 				bs.repeatEnabled = bot.isRepeating();
 				bs.repeatIntervalTicks = bot.getRepeatIntervalTicks();
 				bs.lastTask = toState(bot.getLastTask());
+				if (bot.hasDepositArea()) {
+					BlockPos a = bot.getDepositAreaA();
+					BlockPos b = bot.getDepositAreaB();
+					bs.dposA = new int[]{a.getX(), a.getY(), a.getZ()};
+					bs.dposB = new int[]{b.getX(), b.getY(), b.getZ()};
+					bs.dposDim = bot.getDepositAreaDim() == null
+							? null : bot.getDepositAreaDim().location().toString();
+				}
 				for (Item i : bot.getFilterWhite()) {
 					ResourceLocation id = BuiltInRegistries.ITEM.getKey(i);
 					if (id != null) bs.white.add(id.toString());
@@ -285,6 +296,16 @@ public final class Persistence {
 					if (i != null) black.add(i);
 				}
 				bot.setFilters(white, black);
+
+				// 目的地选区（目的箱轮转）
+				if (bs.dposA != null && bs.dposB != null) {
+					BlockPos da = new BlockPos(bs.dposA[0], bs.dposA[1], bs.dposA[2]);
+					BlockPos db = new BlockPos(bs.dposB[0], bs.dposB[1], bs.dposB[2]);
+					ResourceKey<Level> dd = bs.dposDim == null ? null
+							: ResourceKey.create(net.minecraft.core.registries.Registries.DIMENSION,
+									ResourceLocation.parse(bs.dposDim));
+					bot.setDepositArea(da, db, dd);
+				}
 
 				LootTask last = fromState(bs.lastTask);
 				bot.restorePersisted(last, bs.repeatEnabled, bs.repeatIntervalTicks);
