@@ -114,6 +114,62 @@ public class LootBot {
 	 */
 	private int baselineForTask = -1;
 
+	// ---------------- 累计统计（跨任务、跨重启） ----------------
+
+	/** 累计搬运件数 */
+	private long lifeMoved;
+	/** 累计运行时长（毫秒，只统计任务执行期间） */
+	private long lifeActiveMs;
+	/** 累计完成任务数 */
+	private long lifeTasks;
+
+	public long getLifeMoved() {
+		return lifeMoved;
+	}
+
+	public long getLifeActiveMs() {
+		return lifeActiveMs;
+	}
+
+	public long getLifeTasks() {
+		return lifeTasks;
+	}
+
+	public void restoreLifeStats(long moved, long activeMs, long tasks) {
+		this.lifeMoved = Math.max(0, moved);
+		this.lifeActiveMs = Math.max(0, activeMs);
+		this.lifeTasks = Math.max(0, tasks);
+	}
+
+	/** 人类可读的累计统计（一行） */
+	public String describeLifeStats() {
+		if (lifeMoved == 0 && lifeActiveMs == 0 && lifeTasks == 0) {
+			return "累计: 还没有完成过任务";
+		}
+		// 样本不足 1 分钟时不算效率——否则会算出「331193 件/小时」这种荒谬数字
+		String rateText;
+		if (lifeActiveMs < 60_000L) {
+			rateText = "样本不足（不足 1 分钟）";
+		} else {
+			double hours = lifeActiveMs / 3_600_000.0;
+			rateText = Math.round(lifeMoved / hours) + " 件/小时";
+		}
+		return "累计: 搬运 " + lifeMoved + " 件 · 完成 " + lifeTasks + " 个任务 · 运行 "
+				+ formatDuration(lifeActiveMs) + " · 平均 " + rateText;
+	}
+
+	public static String formatDuration(long ms) {
+		long totalSec = Math.max(0, ms) / 1000L;
+		long totalMin = totalSec / 60;
+		long d = totalMin / (60 * 24);
+		long h = (totalMin / 60) % 24;
+		long m = totalMin % 60;
+		if (d > 0) return d + " 天 " + h + " 小时";
+		if (h > 0) return h + " 小时 " + m + " 分";
+		if (m > 0) return m + " 分 " + (totalSec % 60) + " 秒";
+		return totalSec + " 秒";
+	}
+
 	// ---------------- 目的地选区（目的箱轮转） ----------------
 
 	/** 目的地选区的两个角点；都为 null 表示使用任务里的单点目的地 */
@@ -905,6 +961,9 @@ public class LootBot {
 	private void beginTask(MinecraftServer server, LootTask t) {
 		// 清掉上一轮可能残留的容器认领，避免占着不放
 		ContainerClaims.releaseAll(name);
+		// 清掉扫描/寻路缓存，保证新任务看到的是最新世界
+		ContainerScanner.invalidateAll();
+		PathPlanner.invalidateCache();
 		resetStats(t);
 		Diag.trace(server, name, "开始任务 item=" + t.itemName() + " count=" + t.count()
 				+ " 搬家=" + t.moveAll() + " 扔地上=" + t.dropMode()
@@ -984,6 +1043,15 @@ public class LootBot {
 
 	private void completeTask(MinecraftServer server, ServerPlayer bot, boolean success, String reason) {
 		LootTask done = this.task;
+		// 累计统计：跨任务累计，并由 Persistence 存盘（重启不清零）
+		if (done != null) {
+			lifeMoved += Math.max(0, collectedForTask);
+			lifeTasks++;
+			if (taskStartMs > 0) {
+				lifeActiveMs += Math.max(0, System.currentTimeMillis() - taskStartMs);
+				taskStartMs = 0;
+			}
+		}
 		// 任务结束即归还容器认领
 		ContainerClaims.releaseAll(name);
 		if (done != null) {

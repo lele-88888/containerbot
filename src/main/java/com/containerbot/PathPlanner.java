@@ -38,6 +38,60 @@ public final class PathPlanner {
 
 	private PathPlanner() {}
 
+	// ------------------------------------------------------------------ 路径缓存
+
+	private static final long PATH_TTL_MS = 20_000L;
+	private static final int PATH_CACHE_MAX = 32;
+
+	private record PathEntry(List<BlockPos> path, long at) {}
+
+	private static final java.util.Map<String, PathEntry> PATH_CACHE =
+			new java.util.LinkedHashMap<>(16, 0.75f, true);
+
+	private static long pathHits;
+	private static long pathMisses;
+
+	/** 命中 / 未命中次数（诊断用） */
+	public static long[] cacheStats() {
+		return new long[]{pathHits, pathMisses};
+	}
+
+	public static void invalidateCache() {
+		PATH_CACHE.clear();
+	}
+
+	private static List<BlockPos> getCached(String k, BlockPos realStart) {
+		PathEntry e = PATH_CACHE.get(k);
+		if (e == null) {
+			pathMisses++;
+			return null;
+		}
+		if (System.currentTimeMillis() - e.at() > PATH_TTL_MS) {
+			PATH_CACHE.remove(k);
+			pathMisses++;
+			return null;
+		}
+		// 校验：缓存路径的第一个节点不能离真实起点太远，否则会绕路
+		if (e.path().isEmpty() || e.path().get(0).distSqr(realStart) > 100.0) {
+			pathMisses++;
+			return null;
+		}
+		pathHits++;
+		return new ArrayList<>(e.path());
+	}
+
+	private static void putCached(String k, List<BlockPos> path) {
+		if (path == null || path.isEmpty()) return;
+		if (PATH_CACHE.size() >= PATH_CACHE_MAX) {
+			var it = PATH_CACHE.keySet().iterator();
+			if (it.hasNext()) {
+				it.next();
+				it.remove();
+			}
+		}
+		PATH_CACHE.put(k, new PathEntry(List.copyOf(path), System.currentTimeMillis()));
+	}
+
 	/**
 	 * 寻路到目标容器附近。
 	 *
@@ -58,6 +112,16 @@ public final class PathPlanner {
 			}
 		}
 
+		// ---- 路径缓存 ----
+		// 卸货往返时「走到目的地」的终点固定、起点每次都差不多，命中率很高。
+		// 起点按 4 格量化，并在命中时校验路径首节点离真实起点不远，避免走歪。
+		String cacheKey = level.dimension().location()
+				+ "|" + (start.getX() >> 2) + "," + (start.getY() >> 2) + "," + (start.getZ() >> 2)
+				+ "|" + goal.getX() + "," + goal.getY() + "," + goal.getZ()
+				+ "|" + reachSq;
+		List<BlockPos> cached = getCached(cacheKey, start);
+		if (cached != null) return cached;
+
 		Map<BlockPos, Double> gScore = new HashMap<>();
 		Map<BlockPos, BlockPos> cameFrom = new HashMap<>();
 		Set<BlockPos> closed = new HashSet<>();
@@ -67,7 +131,6 @@ public final class PathPlanner {
 		open.add(new Entry(start, heuristic(start, goal)));
 
 		int expanded = 0;
-
 		while (!open.isEmpty()) {
 			Entry cur = open.poll();
 			BlockPos curPos = cur.pos();
@@ -76,7 +139,9 @@ public final class PathPlanner {
 			if (++expanded > MAX_NODES) break;
 
 			if (reached(curPos, goal, reachSq)) {
-				return reconstruct(cameFrom, curPos);
+				List<BlockPos> found = reconstruct(cameFrom, curPos);
+				putCached(cacheKey, found);
+				return found;
 			}
 
 			double curG = gScore.getOrDefault(curPos, Double.MAX_VALUE);

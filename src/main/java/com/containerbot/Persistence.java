@@ -85,6 +85,8 @@ public final class Persistence {
 		/** 目的地选区（目的箱轮转）；都为空表示单点目的地 */
 		public int[] dposA, dposB;
 		public String dposDim;
+		/** 累计统计（跨重启保留） */
+		public long lifeMoved, lifeActiveMs, lifeTasks;
 		/** 最近一次任务的完整定义（循环恢复要用它） */
 		public TaskState lastTask;
 	}
@@ -228,6 +230,9 @@ public final class Persistence {
 				bs.repeatEnabled = bot.isRepeating();
 				bs.repeatIntervalTicks = bot.getRepeatIntervalTicks();
 				bs.lastTask = toState(bot.getLastTask());
+				bs.lifeMoved = bot.getLifeMoved();
+				bs.lifeActiveMs = bot.getLifeActiveMs();
+				bs.lifeTasks = bot.getLifeTasks();
 				if (bot.hasDepositArea()) {
 					BlockPos a = bot.getDepositAreaA();
 					BlockPos b = bot.getDepositAreaB();
@@ -296,6 +301,7 @@ public final class Persistence {
 					if (i != null) black.add(i);
 				}
 				bot.setFilters(white, black);
+				bot.restoreLifeStats(bs.lifeMoved, bs.lifeActiveMs, bs.lifeTasks);
 
 				// 目的地选区（目的箱轮转）
 				if (bs.dposA != null && bs.dposB != null) {

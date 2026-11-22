@@ -331,6 +331,12 @@ public final class BotCommand {
 				.then(Commands.literal("test")
 						.executes(BotCommand::selfTest))
 
+				// ---- 累计统计 ----
+				.then(Commands.literal("total")
+						.executes(BotCommand::totalAll)
+						.then(Commands.argument("name", StringArgumentType.word())
+								.executes(BotCommand::totalOne)))
+
 				// ---- 音效 ----
 				.then(Commands.literal("sound")
 						.executes(BotCommand::soundInfo)
@@ -1379,7 +1385,8 @@ public final class BotCommand {
 				src.sendFailure(Component.literal("没有该假人的记录: " + name));
 				return 0;
 			}
-			sendLines(src, "【" + bot.getName() + "】\n" + bot.describeStats());
+			sendLines(src, "【" + bot.getName() + "】\n" + bot.describeStats()
+					+ "\n" + bot.describeLifeStats());
 			return 1;
 		}
 		var bots = BotManager.all();
@@ -1388,9 +1395,56 @@ public final class BotCommand {
 			return 0;
 		}
 		for (LootBot bot : bots) {
-			sendLines(src, "【" + bot.getName() + "】\n" + bot.describeStats());
+			sendLines(src, "【" + bot.getName() + "】\n" + bot.describeStats()
+					+ "\n" + bot.describeLifeStats());
 		}
 		return bots.size();
+	}
+
+	/** 累计统计：单个假人 */
+	private static int totalOne(CommandContext<CommandSourceStack> ctx) {
+		CommandSourceStack src = ctx.getSource();
+		String name = StringArgumentType.getString(ctx, "name");
+		LootBot bot = BotManager.get(name);
+		if (bot == null) {
+			src.sendFailure(Component.literal("没有该假人的记录: " + name));
+			return 0;
+		}
+		sendLines(src, "【" + bot.getName() + "】" + bot.describeLifeStats());
+		return 1;
+	}
+
+	/** 累计统计：所有假人合计 */
+	private static int totalAll(CommandContext<CommandSourceStack> ctx) {
+		CommandSourceStack src = ctx.getSource();
+		var bots = BotManager.all();
+		if (bots.isEmpty()) {
+			src.sendSuccess(() -> Component.literal("当前没有任何假人记录"), false);
+			return 0;
+		}
+
+		long moved = 0, activeMs = 0, tasks = 0;
+		for (LootBot bot : bots) {
+			moved += bot.getLifeMoved();
+			activeMs += bot.getLifeActiveMs();
+			tasks += bot.getLifeTasks();
+		}
+		final long m = moved, a = activeMs, t = tasks;
+		final int n = bots.size();
+		// 样本不足 1 分钟不算效率，避免出现荒谬数字
+		final String rateText = a < 60_000L
+				? "样本不足（不足 1 分钟）"
+				: Math.round(m / (a / 3_600_000.0)) + " 件/小时";
+
+		sendLines(src, "===== 累计统计（" + n + " 个假人）====="
+				+ "\n搬运合计: " + m + " 件"
+				+ "\n完成任务: " + t + " 个"
+				+ "\n运行时长: " + LootBot.formatDuration(a)
+				+ "\n平均效率: " + rateText);
+		for (LootBot bot : bots) {
+			sendLines(src, "  " + bot.getName() + " → " + bot.describeLifeStats());
+		}
+		return n;
 	}
 
 	/** 按行发送，避免长消息被聊天栏截断 */
